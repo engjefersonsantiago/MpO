@@ -1,7 +1,7 @@
 open_project -reset proj
 
 add_files duc.cpp -cflags=-std=c++0x
-add_files -tb duc_test.cpp -cflags=std=c++0x
+add_files -tb duc_test.cpp -cflags=-std=c++0x
 
 set_top duc
 #set_top filters

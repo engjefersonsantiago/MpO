@@ -12,18 +12,19 @@
 
 #include <iostream>
 #include <fstream>
-using namespace std;
 
 #include "ap_fixed.h"
 #include <math.h>
+
+using namespace std;
 
 // phase accumulator 
 typedef ap_fixed<32,1> incr_t;  // s.xxxx, +/- 1 = +/- pi = +fs/2 to -fs/2
 typedef ap_fixed<32,1> acc_t;   // s.xxxx, +/- 1 = +/- pi = +fs/2 to -fs/2
 
 // cos lut address, word size
-const int NLUT     = 10;               // bitwidth for cos lut address, covers one quadrant
-const int LUTSIZE  = 1024;             // 2^NLUT
+static constexpr auto NLUT     = 10;               // bitwidth for cos lut address, covers one quadrant
+static constexpr auto LUTSIZE  = 1024;             // 2^NLUT
 typedef ap_uint<NLUT+2> lut_adr_t;     // covers 4 quadrant
 typedef ap_uint<NLUT>   quad_adr_t;    // covers 1 quadrant
 
@@ -33,8 +34,8 @@ typedef ap_fixed<18,1,AP_RND_CONV,AP_SAT_SYM> lut_word_t;
 //typedef double lut_word_t;
 
 // fine lut address, word size
-const int NFINE     = 9;               // bitwidth for fine lut address, covers one quadrant
-const int FINESIZE  = 512;             // 2^NFINE
+static constexpr auto NFINE     = 9;               // bitwidth for fine lut address, covers one quadrant
+static constexpr auto FINESIZE  = 512;             // 2^NFINE
 typedef ap_uint<NLUT+2> fine_adr_t;    // covers 4 quadrant
 //typedef ap_fixed<18,1,AP_RND_INF,AP_SAT_SYM> fine_word_t;
 //typedef ap_fixed<18,1> fine_word_t;
@@ -43,7 +44,7 @@ typedef ap_uint<NLUT+2> fine_adr_t;    // covers 4 quadrant
 //typedef double fine_word_t;
 typedef ap_fixed<18,-7> fine_word_t;
 
-const double DELTA = M_PI/(2*LUTSIZE*FINESIZE); // fine lut resolution, range covers 0 to pi/(2*LUTSIZE)
+static const double DELTA = M_PI/(2*LUTSIZE*FINESIZE); // fine lut resolution, range covers 0 to pi/(2*LUTSIZE)
 
 // DDS output = f(cos lut, fine table)
 //typedef ap_fixed<18,1,AP_RND_CONV,AP_SAT_SYM> dds_t;
@@ -56,179 +57,173 @@ typedef ap_fixed<16,1,AP_RND_CONV,AP_SAT_SYM> dds_t;
 // OUTPUT_T: output data type
 //______________________________________________________________________________ 
 
-template < int N, typename DDS_T, typename OUTPUT_T >
-class dds_class {
+template <int N, typename DDS_T, typename OUTPUT_T> class dds_class {
 
-// tables
-lut_word_t  cos_lut[LUTSIZE];
-fine_word_t fine_lut[FINESIZE];
+    private:
+        // tables
+        lut_word_t  cos_lut[LUTSIZE];
+        fine_word_t fine_lut[FINESIZE];
+        
+        // accumulator
+        acc_t acc;
+        
+    public:
+    
+    	//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+    	dds_class() : acc (0) {}
 
-// accumulator
-acc_t acc;
+        //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+        void mix (DDS_T *dds_cos, DDS_T *dds_sin, OUTPUT_T *dout_i, OUTPUT_T *dout_q, OUTPUT_T *dout) {
+        
+            OUTPUT_T  dout_tmp;
+            
+            L1: for(int i=0;i<N;i++) {
+            #pragma HLS pipeline rewind
+                dout[i]  = dout_tmp;
+                dout_tmp = dout_i[i] * dds_cos[i] - dout_q[i] * dds_sin[i];
+            }
 
-// for dithering
-// ap_uint<1> sr[19];
-
-
-public:
-
-	//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-	dds_class() : acc (0) {}
-
-
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-void mix ( DDS_T *dds_cos, DDS_T *dds_sin, OUTPUT_T *dout_i, OUTPUT_T *dout_q, OUTPUT_T *dout) {
-
-//static OUTPUT_T  dout_tmp;
-OUTPUT_T  dout_tmp;
-
-L1: for(int i=0;i<N;i++) {
-#pragma HLS pipeline rewind
-    dout[i]  = dout_tmp;
-    dout_tmp = dout_i[i] * dds_cos[i] - dout_q[i] * dds_sin[i];
-}
-
-}
+        }
  
 
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-void init_cos_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
+        //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+        void init_cos_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
+        
+            double cos_double;
+            //ofstream fp_dout ("debug.txt");
+            
+            // #define FULL
+            //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+            #ifdef MIDPOINT
+            
+            // store single quadrant
+              for (int i=0;i<LUTSIZE;i++) {
+                  //cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
+                  cos_double = cos(2*M_PI*(0.5+(double)i)/(4*LUTSIZE));
+                  cos_lut[i] = cos_double;
+                  fp_dout << scientific << cos_double <<endl;
+              }
+            
+            
+            #ifdef FULL
+            // store full quadrant
+            ofstream fp_ideal ("ideal.txt");
+              for (int i=0;i<4*LUTSIZE;i++) {
+                  cos_double = cos(2*M_PI*(0.5+(double)i)/(4*LUTSIZE));
+                  fp_ideal << scientific << cos_double <<endl;
+              }
+            #endif
+            
+            #else
+            //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+            // not the mid point
+            
+            // store single quadrant
+              for (int i=0;i<LUTSIZE;i++) {
+                  cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
+                  cos_lut[i] = cos_double;
+                  //fp_dout << scientific << cos_double <<endl;
+              }
+            
+            #ifdef FULL
+            // store full quadrant
+            ofstream fp_ideal ("ideal.txt");
+              for (int i=0;i<4*LUTSIZE;i++) {
+                  cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
+                  fp_ideal << scientific << cos_double <<endl;
+              }
+            #endif
+            
+            
+            #endif
+        
+        }
 
-double cos_double;
-//ofstream fp_dout ("debug.txt");
 
-// #define FULL
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-#ifdef MIDPOINT
+        //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+        void read_cos_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
+        
+          lut_adr_t i;            // cover full quadrant
+          quad_adr_t lsb,adr;     // cover 1/4 quadrant
+          ap_uint<2>  msb;        // specify which quadrant
+          lut_word_t  lut_word; 
+        
+          ofstream fp_dout ("fullcos.txt");
+        
+          for (int k=0;k<4*LUTSIZE;k++) {
+        
+            i    = k;
+            msb  = i(11,10);
+            lsb  = i(9,0);
+        
+            if (msb==0) {        // right top
+               adr      = lsb;
+               lut_word = cos_lut[adr];
+            } else if (msb==1) {  // left top 
+               if (lsb==0) lut_word = 0;
+               else { 
+                 adr      = -lsb;
+                 lut_word = -cos_lut[adr];
+               }
+            } else if (msb==3) {  // right bot
+               if (lsb==0) lut_word = 0;
+               else { 
+                 adr      = -lsb;
+                 lut_word =  cos_lut[adr];
+               }
+            } else             {  // left bot 
+                 adr      =  lsb;
+                 lut_word = -cos_lut[adr];
+            }
+        
+            fp_dout << scientific << lut_word << endl;
+        
+          }
+        
+        }
 
-// store single quadrant
-  for (int i=0;i<LUTSIZE;i++) {
-      //cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
-      cos_double = cos(2*M_PI*(0.5+(double)i)/(4*LUTSIZE));
-      cos_lut[i] = cos_double;
-      fp_dout << scientific << cos_double <<endl;
-  }
-
-
-#ifdef FULL
-// store full quadrant
-ofstream fp_ideal ("ideal.txt");
-  for (int i=0;i<4*LUTSIZE;i++) {
-      cos_double = cos(2*M_PI*(0.5+(double)i)/(4*LUTSIZE));
-      fp_ideal << scientific << cos_double <<endl;
-  }
-#endif
-
-#else
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-// not the mid point
-
-// store single quadrant
-  for (int i=0;i<LUTSIZE;i++) {
-      cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
-      cos_lut[i] = cos_double;
-      //fp_dout << scientific << cos_double <<endl;
-  }
-
-#ifdef FULL
-// store full quadrant
-ofstream fp_ideal ("ideal.txt");
-  for (int i=0;i<4*LUTSIZE;i++) {
-      cos_double = cos(2*M_PI*(0.0+(double)i)/(4*LUTSIZE));
-      fp_ideal << scientific << cos_double <<endl;
-  }
-#endif
-
-
-#endif
-
-}
-
-
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-void read_cos_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
-
-  lut_adr_t i;            // cover full quadrant
-  quad_adr_t lsb,adr;     // cover 1/4 quadrant
-  ap_uint<2>  msb;        // specify which quadrant
-  lut_word_t  lut_word; 
-
-  ofstream fp_dout ("fullcos.txt");
-
-  for (int k=0;k<4*LUTSIZE;k++) {
-
-    i    = k;
-    msb  = i(11,10);
-    lsb  = i(9,0);
-
-    if (msb==0) {        // right top
-       adr      = lsb;
-       lut_word = cos_lut[adr];
-    } else if (msb==1) {  // left top 
-       if (lsb==0) lut_word = 0;
-       else { 
-         adr      = -lsb;
-         lut_word = -cos_lut[adr];
-       }
-    } else if (msb==3) {  // right bot
-       if (lsb==0) lut_word = 0;
-       else { 
-         adr      = -lsb;
-         lut_word =  cos_lut[adr];
-       }
-    } else             {  // left bot 
-         adr      =  lsb;
-         lut_word = -cos_lut[adr];
-    }
-
-    fp_dout << scientific << lut_word << endl;
-
-  }
-
-}
-
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-void read_sine_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
-
-  lut_adr_t i;            // cover full quadrant
-  quad_adr_t lsb,adr;     // cover 1/4 quadrant
-  ap_uint<2>  msb;        // specify which quadrant
-  lut_word_t  lut_word; 
-
-  ofstream fp_dout ("fullsine.txt");
-
-  for (int k=0;k<4*LUTSIZE;k++) {
-
-    i    = k;
-    msb  = i(11,10);
-    lsb  = i(9,0);
-
-    if (msb==1) {         // left top
-       adr      = lsb;
-       lut_word = cos_lut[adr];
-    } else if (msb==2) {  // left bot 
-       if (lsb==0) lut_word = 0;
-       else { 
-         adr      = -lsb;
-         lut_word = -cos_lut[adr];
-       }
-    } else if (msb==0) {  // right top
-       if (lsb==0) lut_word = 0;
-       else { 
-         adr      = -lsb;
-         lut_word =  cos_lut[adr];
-       }
-    } else             {  // right bot 
-         adr      =  lsb;
-         lut_word = -cos_lut[adr];
-    }
-
-    fp_dout << scientific << lut_word << endl;
-
-  }
-
-}
-
+        //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+        void read_sine_lut( lut_word_t cos_lut[LUTSIZE], const int LUTSIZE ) {
+        
+          lut_adr_t i;            // cover full quadrant
+          quad_adr_t lsb,adr;     // cover 1/4 quadrant
+          ap_uint<2>  msb;        // specify which quadrant
+          lut_word_t  lut_word; 
+        
+          ofstream fp_dout ("fullsine.txt");
+        
+          for (int k=0;k<4*LUTSIZE;k++) {
+        
+            i    = k;
+            msb  = i(11,10);
+            lsb  = i(9,0);
+        
+            if (msb==1) {         // left top
+               adr      = lsb;
+               lut_word = cos_lut[adr];
+            } else if (msb==2) {  // left bot 
+               if (lsb==0) lut_word = 0;
+               else { 
+                 adr      = -lsb;
+                 lut_word = -cos_lut[adr];
+               }
+            } else if (msb==0) {  // right top
+               if (lsb==0) lut_word = 0;
+               else { 
+                 adr      = -lsb;
+                 lut_word =  cos_lut[adr];
+               }
+            } else             {  // right bot 
+                 adr      =  lsb;
+                 lut_word = -cos_lut[adr];
+            }
+        
+            fp_dout << scientific << lut_word << endl;
+        
+          }
+        
+        }
+        
 
 #if 0
 //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
@@ -265,22 +260,22 @@ return whole;
 
 #endif
 
-//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
-void init_fine_lut( fine_word_t fine_lut[FINESIZE], 
-                    const int FINESIZE, const double delta ) {
-
-//double fine_double;
-double sine_double;
-//ofstream fp_dout ("fine.txt");
-
-  for (int i=0;i<FINESIZE;i++) {
-      //fine_double = cos(delta*(double)i);
-      sine_double = sin(delta*(double)i);
-      fine_lut[i] = sine_double;
-      //fp_dout << scientific << fine_double <<", " << scientific << sine_double <<endl;
-  }
-
-}
+        //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+        void init_fine_lut( fine_word_t fine_lut[FINESIZE], 
+                            const int FINESIZE, const double delta ) {
+        
+            //double fine_double;
+            double sine_double;
+            //ofstream fp_dout ("fine.txt");
+            
+              for (int i=0;i<FINESIZE;i++) {
+                  //fine_double = cos(delta*(double)i);
+                  sine_double = sin(delta*(double)i);
+                  fine_lut[i] = sine_double;
+                  //fp_dout << scientific << fine_double <<", " << scientific << sine_double <<endl;
+              }
+        
+        }
 
 
 //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 

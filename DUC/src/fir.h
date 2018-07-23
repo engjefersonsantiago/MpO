@@ -13,6 +13,7 @@
 #include <array>
 #include <algorithm>
 #include <iterator>
+#include <type_traits>
 
 //______________________________________________________________________________
 // filter precision
@@ -38,14 +39,47 @@ typedef float PROD_T;
 typedef float ACC_T;
 #endif
 
+struct Mac {
+    // MAC engine: 1 operator
+    ACC_T operator()(const DATA_T& din, const COEF_T& coef, const ACC_T&  acc) {
+	PROD_T  prod   = din*coef;
+        ACC_T   sum    = prod + acc;
+        return sum;
+    };
+
+    // MAC engine overload: 2 operators for pre adder
+    ACC_T operator()(const DATA_T&  din0, const DATA_T& din1,
+                     const COEF_T& coef, const ACC_T& acc) {
+	DATA2_T preadd = din0 + din1;
+        PROD_T  prod   = preadd*coef;
+        ACC_T   sum    = prod + acc;
+        return sum;
+    }
+};
+
+template<size_t HALF, bool ODD> struct NonSymAcc {
+    template<typename T_Coeff, typename T_Sr, typename T_Mac>
+    void operator()(const T_Coeff& coef, ACC_T&  acc, const T_Sr& sr, T_Mac&& mac) {
+        for (int i=0; i<HALF; i++)
+            acc = mac(sr[i], sr[sr.size()-1-i], coef[i], acc);
+        
+        if (ODD)
+            acc = mac(sr[HALF], coef[HALF], acc);
+    }
+};
+
+
 template<int l_INPUT, int l_OUTPUT, int l_TDL, int l_COEFF, int II_IntFactor>
 class FirCommon {
     public:
         typedef std::array<DATA_T, l_INPUT> Din_arr_t;
         typedef std::array<DATA_T, l_OUTPUT> Dout_arr_t;
         typedef std::array<DATA_T, l_TDL> Sr_arr_t;
-        typedef std::array<ACC_T, II_IntFactor> Acc_arr_t;
-        typedef std::array<std::array<COEF_T, l_COEFF>, II_IntFactor> Coeff_arr_t;
+        typedef typename std::conditional<(II_IntFactor > 1),
+                std::array<ACC_T, II_IntFactor>, ACC_T>::type Acc_arr_t;
+        typedef typename std::conditional<(II_IntFactor > 1),
+                std::array<std::array<COEF_T, l_COEFF>, II_IntFactor>,
+                std::array<COEF_T, l_COEFF>>::type Coeff_arr_t;
 
         Sr_arr_t sr;
         Acc_arr_t acc;
@@ -53,7 +87,7 @@ class FirCommon {
 
 		// SR: 1 input
         void shift_register(const DATA_T& din_, Sr_arr_t& sr_) {
-        	//#pragma HLS
+	//#pragma HLS
 			std::copy(std::begin(sr_), std::end(sr_) - 1, std::begin(sr_) + 1);
 			sr_[0] = din_;
         }
@@ -68,27 +102,8 @@ class FirCommon {
         FirCommon(const Coeff_arr_t& cin) : coeff(cin) {
             #pragma HLS array_partition variable=sr  complete
 			#pragma HLS array_partition variable=coeff complete
-			#pragma HLS array_partition variable=acc complete
         }
 
-
-};
-
-struct MAC {
-    // MAC engine: 1 operator
-    ACC_T operator()(const DATA_T& din, const COEF_T& coef, const ACC_T&  acc ) {
-    	PROD_T  prod   = din*coef;
-        ACC_T   sum    = prod + acc;
-        return sum;
-    };
-
-    // MAC engine overload: 2 operators for pre adder
-    ACC_T operator()(const DATA_T&  din0, const DATA_T& din1, const COEF_T& coef, const ACC_T& acc) {
-    	DATA2_T preadd = din0 + din1;
-        PROD_T  prod   = preadd*coef;
-        ACC_T   sum    = prod + acc;
-        return sum;
-    }
 };
 
 //______________________________________________________________________________
@@ -102,61 +117,52 @@ struct MAC {
 //______________________________________________________________________________
 
 template<size_t l_WHOLE, size_t l_COEF, size_t l_SAMPLE, size_t II_GOAL, typename D_FIR>
-class fir_base {
+class FirBase {
 
 	protected:
 		// Types
-		typedef std::array<DATA_T, l_WHOLE> Data_arr_t;		// SR and data
-		typedef std::array<DATA_T, l_SAMPLE> Sample_arr_t;	// sample data
-		typedef std::array<COEF_T, l_COEF> Coeff_arr_t;	    // coeff
+        typedef FirCommon<l_SAMPLE, l_SAMPLE, l_WHOLE, l_COEF, 1> Common;
 
 		// Constants
 		static constexpr auto ODD    = l_WHOLE % 2;
 		static constexpr auto l_HALF = l_WHOLE/2;
 
 		// Data members
-		Data_arr_t sr;
-		ACC_T  acc;
-		const Coeff_arr_t coeff;
-        MAC Mac;
+        Common firCommon_;
 
-        // Init array function
-        template<typename T, size_t N>
-        static std::array<T, N> init_array(const T carr[N]) {
-	        std::array<T, N> arr {};
-		    std::copy(carr, &carr[N-1], arr.begin());
-	        return arr;
+
+        //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
+        // initialize coefficient
+        const typename Common::Coeff_arr_t init(const COEF_T cin[]) const {
+            typename Common::Coeff_arr_t coeff;
+            std::copy(&cin[0], &cin[coeff.size() - 1], std::begin(coeff));
+            return coeff;
         }
 
-	public:
+    public:
 
 		//_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
 		// filter
 		void process (const DATA_T& din, DATA_T& dout) {
 			#pragma HLS INLINE
 			// using 'factor' instead of 'complete' uses BRAM instead of FF
-			#pragma HLS array_reshape variable=sr  complete
-			#pragma HLS array_reshape variable=coeff complete dim=0
-			acc = 0;
+			firCommon_.acc = 0;
 
 			// Calls the specific method
-			static_cast<D_FIR*>(this)->accum_impl(sr, acc, coeff);
+			static_cast<D_FIR*>(this)->accum_impl(firCommon_.sr, firCommon_.acc, firCommon_.coeff);
 
 			// SR
-			std::copy(sr.begin(), sr.end() - 1, sr.begin() + 1);
+            firCommon_.shift_register(din, firCommon_.sr);
 
-			sr[0] = din;
-			dout = acc;
+            dout = firCommon_.acc;
 
 		}
 
 		//_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 		// filter frame
 		//
-		void process_frame(const Sample_arr_t& din, Sample_arr_t& dout)
+		void process_frame(const typename Common::Din_arr_t& din, typename Common::Dout_arr_t& dout)
 		{
-			// not much difference inline
-			//#pragma HLS INLINE
 			for (auto i = 0; i < din.size(); ++i) {
 				#pragma HLS pipeline II=II_GOAL rewind
 				process (din[i], dout[i]);
@@ -164,8 +170,8 @@ class fir_base {
 		}
 
 		//constructor
-		fir_base(const Coeff_arr_t& cin) : coeff(cin) {}
-		fir_base(const COEF_T cin[l_COEF]) : coeff(init_array<COEF_T, l_COEF>(cin)) {}
+		FirBase(const typename Common::Coeff_arr_t& cin) : firCommon_(cin) {}
+		FirBase(const COEF_T cin[]) : firCommon_(init(cin)) {}
 
 }; // fir_base
 
@@ -177,27 +183,30 @@ class fir_base {
 //    -l_SAMPLE: number of data samples to process
 //    -II_GOAL:  initiation interval goal
 //______________________________________________________________________________
-template<size_t l_WHOLE, size_t l_COEF, size_t l_SAMPLE, size_t II_GOAL>
-class nosym_fir : public fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, nosym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> {
+template<size_t l_WHOLE, size_t l_SAMPLE, size_t II_GOAL>
+class FirNoSym : public FirBase<l_WHOLE, l_WHOLE, l_SAMPLE, II_GOAL,
+        FirNoSym<l_WHOLE, l_SAMPLE, II_GOAL>> {
 
 	private:
-		typedef fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, nosym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> Base;
+		typedef FirBase<l_WHOLE, l_WHOLE, l_SAMPLE, II_GOAL,
+                FirNoSym<l_WHOLE, l_SAMPLE, II_GOAL>> Base;
+        typedef typename Base::Common Common;
 
 	public:
 
 		//_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
 		// filter
-		void accum_impl (const typename Base::Data_arr_t& sr, ACC_T& acc, const typename Base::Coeff_arr_t& coeff) {
-			for (auto i = 0; i < coeff.size(); ++i) {
-				acc = this->Mac(sr[i], coeff[i], acc);
-			}
+		void accum_impl (const typename Common::Sr_arr_t& sr, ACC_T& acc,
+                         const typename Common::Coeff_arr_t& coeff) {
+            Mac mac;
+			for (auto i = 0; i < coeff.size(); ++i)
+				acc = mac(sr[i], coeff[i], acc);
 		}
 
 		//constructor
-		nosym_fir(const typename Base::Coeff_arr_t& cin) : Base(cin) {}
-		nosym_fir(const COEF_T cin[l_COEF]) : Base(cin) {}
+		FirNoSym(const COEF_T cin[l_WHOLE]) : Base(cin) {}
 
-}; // nosym_fir
+}; // FirNoSym
 
 //______________________________________________________________________________
 // single rate, symmetric fir classs
@@ -207,29 +216,35 @@ class nosym_fir : public fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, nosym_fir<
 //    -l_SAMPLE: number of data sample
 //    -II_GOAL:  initiation interval goal
 //______________________________________________________________________________
-template<size_t l_WHOLE, size_t l_COEF, size_t l_SAMPLE, size_t II_GOAL>
-class sym_fir : public fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, sym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> {
+template<size_t l_WHOLE> struct FirSymCfg {
+    static constexpr auto l_COEF = l_WHOLE/2 + l_WHOLE%2;  // number of unique coefficients
+};
+
+template<size_t l_WHOLE, size_t l_SAMPLE, size_t II_GOAL>
+class FirSym : public FirBase<l_WHOLE, FirSymCfg<l_WHOLE>::l_COEF, l_SAMPLE, II_GOAL,
+        FirSym<l_WHOLE, l_SAMPLE, II_GOAL>> {
 
 	private:
-		typedef fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, sym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> Base;
+		typedef FirBase<l_WHOLE, FirSymCfg<l_WHOLE>::l_COEF, l_SAMPLE, II_GOAL,
+                FirSym<l_WHOLE, l_SAMPLE, II_GOAL>> Base;
+        typedef typename Base::Common Common;
 
 	public:
 
-		void accum_impl (const typename Base::Data_arr_t& sr, ACC_T& acc, const typename Base::Coeff_arr_t& coeff) {
+		void accum_impl (const typename Base::Din_arr_t& sr, ACC_T& acc,
+                         const typename Base::Coeff_arr_t& coeff) {
+            Mac mac;
+		    
+            // Acc Kernel
+            NonSymAcc<Base::l_HALF, Base::ODD> nsAcc;
+            nsAcc(coeff, acc, sr, mac);
 
-			for (auto i = 0; i < this->l_HALF; ++i) {
-				acc = this->Mac(sr[i], sr[l_WHOLE-1-i], coeff[i], acc);
-            }
-			if (this->ODD) {
-				acc = this->Mac(sr[this->l_HALF], coeff[this->l_HALF], acc);
-            }
 		}
 
 		//constructor
-		sym_fir(const typename Base::Coeff_arr_t& cin) : Base(cin) {}
-		sym_fir(const COEF_T cin[l_COEF]) : Base(cin) {}
+		FirSym(const COEF_T cin[FirSymCfg<l_WHOLE>::l_COEF]) : Base(cin) {}
 
-}; // sym_class
+}; // FirSym
 
 //______________________________________________________________________________
 // single rate, halfband fir classs
@@ -239,37 +254,41 @@ class sym_fir : public fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, sym_fir<l_WH
 //    -l_SAMPLE: number of data sample
 //    -II_GOAL:  initiation interval goal
 //______________________________________________________________________________
-template<size_t l_WHOLE, size_t l_COEF, size_t l_SAMPLE, size_t II_GOAL>
-class hb_fir : public fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, sym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> {
+template<size_t l_WHOLE> struct FirHbCfg {
+    static constexpr auto l_COEF = (l_WHOLE+1)/4+1;  // number of unique coefficients
+};
+
+template<size_t l_WHOLE, size_t l_SAMPLE, size_t II_GOAL>
+class FirHb : public FirBase<l_WHOLE, FirHbCfg<l_WHOLE>::l_COEF, l_SAMPLE, II_GOAL,
+        FirHb<l_WHOLE, l_SAMPLE, II_GOAL>> {
 
 	private:
-		typedef fir_base<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL, sym_fir<l_WHOLE, l_COEF, l_SAMPLE, II_GOAL>> Base;
+		typedef FirBase<l_WHOLE, FirHbCfg<l_WHOLE>::l_COEF, l_SAMPLE, II_GOAL,
+                FirHb<l_WHOLE, l_SAMPLE, II_GOAL>> Base;
+        typedef typename Base::Common Common;
 
 	public:
 
-		void accum_impl (const typename Base::Data_arr_t& sr, ACC_T& acc, const typename Base::Coeff_arr_t& coeff) {
-			unsigned short k=0;
-
-			for (int i = 0; i < l_COEF - 1; ++i) {
-				acc = this->Mac(sr[k], sr[l_WHOLE-1-k], coeff[i], acc);
-				k+=2;
-			}
+		void accum_impl (const typename Base::Data_arr_t& sr, ACC_T& acc,
+                         const typename Base::Coeff_arr_t& coeff) {
+            Mac mac;
+			for (int i = 0, k = 0; i < coeff.size() - 1; ++i, k+=2)
+				acc = mac(sr[k], sr[l_WHOLE-1-k], coeff[i], acc);
 
 			// center tap
-			acc = this->Mac(sr[this->l_HALF], 0, coeff[l_COEF-1], acc);
+			acc = mac(sr[Base::l_HALF], 0, coeff.bottom(), acc);
 		}
 
 		//constructor
-		hb_fir(const typename Base::Coeff_arr_t& cin) : Base(cin) {}
-		hb_fir(const COEF_T cin[l_COEF]) : Base(cin) {}
+		FirHb(const COEF_T cin[FirHbCfg<l_WHOLE>::l_COEF]) : Base(cin) {}
 
-}; // hb_fir
+}; // FirHb
 
 template<int l_INPUT, int II_GOAL, int l_TDL, int l_COEFF, int II_IntFactor, typename D_FIR>
 class FirInterp2Base {
 	protected:
-    	typedef FirCommon<l_INPUT, 2*l_INPUT, l_TDL, l_COEFF, II_IntFactor> Common;
-    	Common firCommon_;
+	    typedef FirCommon<l_INPUT, 2*l_INPUT, l_TDL, l_COEFF, II_IntFactor> Common;
+	    Common firCommon_;
 
     public:
 
@@ -288,10 +307,11 @@ class FirInterp2Base {
 
         }
 
-        void process_frame(const typename Common::Din_arr_t& din, typename Common::Dout_arr_t& dout) {
+        void process_frame(const typename Common::Din_arr_t& din,
+                           typename Common::Dout_arr_t& dout) {
             std::array<DATA_T, 2> dout_tmp = {{ 0, 0 }};
             #pragma HLS array_partition variable=dout_tmp dim=1
-            
+
             for (auto i = 0; i < din.size(); ++i) {
                 #pragma HLS pipeline II=II_GOAL rewind
                 process(din[i], dout_tmp);
@@ -323,9 +343,9 @@ template<int l_WHOLE> struct FirInterp2Cfg {
 
 template<int l_WHOLE, int l_INPUT, int II_GOAL>
 class FirInterp2 : public FirInterp2Base<l_INPUT, II_GOAL,
-		FirInterp2Cfg<l_WHOLE>::l_TDL,
+        FirInterp2Cfg<l_WHOLE>::l_TDL,
 		FirInterp2Cfg<l_WHOLE>::l_NONZERO,
-		FirInterp2Cfg<l_WHOLE>::INTERP_FACTOR,
+        FirInterp2Cfg<l_WHOLE>::INTERP_FACTOR,
 		FirInterp2<l_WHOLE, l_INPUT, II_GOAL>> {
 
     protected:
@@ -338,11 +358,10 @@ class FirInterp2 : public FirInterp2Base<l_INPUT, II_GOAL,
 
     public:
 
-        void accum_impl(const typename Common::Sr_arr_t& sr,
-                        typename Common::Acc_arr_t& acc,
+        void accum_impl(const typename Common::Sr_arr_t& sr, typename Common::Acc_arr_t& acc,
                         const typename Common::Coeff_arr_t& coeff) {
             acc = {{ 0, 0 }};
-            MAC mac;
+            Mac mac;
             for (auto i = 0; i < Config::l_NONZERO - Config::ODD; ++i) {
                 // even number of taps, has one more than ODD one
                 acc[0] = mac(sr[i], sr[Config::l_TDL-1-i], coeff[0][i], acc[0]);
@@ -355,11 +374,10 @@ class FirInterp2 : public FirInterp2Base<l_INPUT, II_GOAL,
             acc[0] = mac(sr[Config::l_NONZERO-1], coeff[0][Config::l_NONZERO-1], acc[0]);
         }
 
-        void ouput_impl(std::array<DATA_T, 2>& dout,
-        				const typename Common::Sr_arr_t&,
+        void ouput_impl(std::array<DATA_T, 2>& dout, const typename Common::Sr_arr_t&,
                         const typename Common::Acc_arr_t& acc,
                         const typename Common::Coeff_arr_t&)  {
-        	dout = {{ acc[0], acc[1] }};
+	        dout = {{ acc[0], acc[1] }};
         }
 
         // initialize coefficient for polyphase decomposition
@@ -404,9 +422,9 @@ template<int l_WHOLE> struct FirInterp2HbCfg {
 
 template<int l_WHOLE, int l_INPUT, int II_GOAL>
 class FirInterp2Hb : public FirInterp2Base<l_INPUT, II_GOAL,
-		FirInterp2HbCfg<l_WHOLE>::l_TDL,
-		FirInterp2HbCfg<l_WHOLE>::l_NONZERO, 1,
-		FirInterp2Hb<l_WHOLE, l_INPUT, II_GOAL>> {
+        FirInterp2HbCfg<l_WHOLE>::l_TDL,
+        FirInterp2HbCfg<l_WHOLE>::l_NONZERO, 1,
+        FirInterp2Hb<l_WHOLE, l_INPUT, II_GOAL>> {
 
     protected:
 		typedef FirInterp2HbCfg<l_WHOLE> Config;
@@ -419,22 +437,19 @@ class FirInterp2Hb : public FirInterp2Base<l_INPUT, II_GOAL,
 
         //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
         // filter
-        void accum_impl(const typename Common::Sr_arr_t& sr,
-                        typename Common::Acc_arr_t& acc,
+        void accum_impl(const typename Common::Sr_arr_t& sr, typename Common::Acc_arr_t& acc,
                         const typename Common::Coeff_arr_t& coeff) {
-            acc = {{ 0 }};
-            MAC mac;
-            for (auto i = 0; i < Config::l_NONZERO - 1; ++i) {
-                acc[0] = mac(sr[i], sr[Config::l_TDL-1-i], coeff[0][i], acc[0]);
-            }
+            acc =  0 ;
+            Mac mac;
+            for (auto i = 0; i < Config::l_NONZERO - 1; ++i)
+                acc = mac(sr[i], sr[Config::l_TDL-1-i], coeff[i], acc);
 
         }
 
-        void ouput_impl(std::array<DATA_T, 2>& dout,
-        				const typename Common::Sr_arr_t& sr,
+        void ouput_impl(std::array<DATA_T, 2>& dout, const typename Common::Sr_arr_t& sr,
                         const typename Common::Acc_arr_t& acc,
                         const typename Common::Coeff_arr_t& coeff) {
-            dout = {{ acc[0], coeff[0][Config::l_NONZERO-1]*sr[Config::l_NONZERO-1] }};
+            dout = {{ acc, coeff[Config::l_NONZERO-1]*sr[Config::l_NONZERO-1] }};
         }
 
         //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
@@ -442,9 +457,9 @@ class FirInterp2Hb : public FirInterp2Base<l_INPUT, II_GOAL,
         const typename Common::Coeff_arr_t init(const COEF_T cin[]) const {
             static constexpr auto gain = 2;  // only for DUC
             typename Common::Coeff_arr_t coeff;
-            for (auto i = 0; i < Config::l_NONZERO; ++i) {
-                coeff[0][i]  = gain*((i == Config::l_NONZERO - 1) ? cin[2*i-1] : cin[2*i]);
-            }
+            for (auto i = 0; i < Config::l_NONZERO; ++i)
+                coeff[i]  = gain*((i == Config::l_NONZERO - 1) ? cin[2*i-1] : cin[2*i]);
+
             return coeff;
         }
 
@@ -463,76 +478,59 @@ class FirInterp2Hb : public FirInterp2Base<l_INPUT, II_GOAL,
 //______________________________________________________________________________
 
 template<int l_WHOLE, int l_OUTPUT, int II_GOAL>
-class decim2_class {
+class FirDecim2 {
 
     private:
         static constexpr auto ODD    = l_WHOLE % 2;
         static constexpr auto l_HALF = l_WHOLE/2;
         static constexpr auto l_COEF = l_WHOLE/2 + ODD;
-
-        DATA_T sr[l_WHOLE];
-        ACC_T  acc;
-        COEF_T coeff[l_COEF];
+	    typedef FirCommon<2*l_OUTPUT, l_OUTPUT, l_WHOLE, l_COEF, 1> Common;
+	    Common firCommon_;
 
     public:
 
         //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
         // filter
-        void process( DATA_T din0, DATA_T din1, DATA_T* dout) {
+        void process(const std::array<DATA_T, 2>& din, DATA_T& dout) {
 
-            // using 'factor' instead of 'complete' uses BRAM instead of FF
-            #pragma HLS array_reshape variable=sr  complete
-            #pragma HLS array_reshape variable=coeff complete dim=0
+            firCommon_.acc =  0;
+            Mac mac;
+            
+            // Acc kernel
+            NonSymAcc<l_HALF, ODD> nsAcc;
+            nsAcc(firCommon_.coeff, firCommon_.acc, firCommon_.sr, mac);
+            
+            firCommon_.shift_register({ din[1], din[0] }, firCommon_.sr);
 
-            acc = 0;
-
-            for (int i=0; i<l_HALF; i++)
-                acc = MAC(sr[i], sr[l_WHOLE-1-i], coeff[i], acc);
-
-            if (ODD)
-                acc = MAC(sr[l_HALF], coeff[l_HALF], acc);
-
-            for (int i=l_WHOLE-1; i>1 ; i--)
-                sr[i] = sr[i-2];
-
-            sr[1] = din0;
-            sr[0] = din1; // most recent sample
-
-            *dout = acc;
+            dout = firCommon_.acc;
 
         }
 
         //_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
         // filter frame
-        void process_frame(DATA_T din[2*l_OUTPUT], DATA_T dout[l_OUTPUT]) {
-
-            DATA_T din0, din1;
+        void process_frame (const typename Common::Din_arr_t& din,
+                           typename Common::Dout_arr_t& dout) {
 
             for (int i=0; i<l_OUTPUT; i++ ) {
                 #pragma HLS pipeline II=II_GOAL rewind
-                din0 = din[2*i];
-                din1 = din[2*i+1];
-                process (din0, din1, dout[i]);
+                process ({ din[2*i], din[2*i+1] }, dout[i]);
             }
         }
 
         //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
         // initialize coefficient
-        void init(const COEF_T cin[l_WHOLE] ) {
-
-            for (int i=0; i<l_COEF-1; i++) {
-                coeff[i]  = cin[i];
-            }
+        const typename Common::Coeff_arr_t init(const COEF_T cin[l_WHOLE]) const {
+            typename Common::Coeff_arr_t coeff;
+            std::copy(&cin[0], &cin[coeff.size() - 1], std::begin(coeff));
+            return coeff;
         }
 
         //constructor
-        decim2_class(const COEF_T cin[l_WHOLE]) {
-            init(cin);
-        }
+        FirDecim2(const COEF_T cin[l_WHOLE]) : firCommon_(init(cin)) {}
 
-        decim2_class(void) {}
 
-}; // decim2_class
+}; // FirDecim2
+
 
 //______________________________________________________________________________
 // decimate by 2, halfband fir classs
@@ -541,49 +539,39 @@ class decim2_class {
 //    -l_WHOLE:   number of taps
 //
 //______________________________________________________________________________
-
 template<int l_WHOLE>
-class hb_decim2_class {
+class FirHbDecim2 {
 
     protected:
         static const int l_HALF = l_WHOLE/2;
         static const int l_COEF = (l_WHOLE+1)/4+1; // number of nonzero coeff
-
-        DATA_T sr[l_WHOLE];
-        ACC_T  acc;
+	typedef FirCommon<1, 1, l_WHOLE, 1, 1> Common;
+	Common firCommon_;
 
     public:
 
         //_  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _
         // filter
-
-        void process ( DATA_T din0, DATA_T din1, DATA_T* dout, const COEF_T cin[l_COEF]) {
+        void process(const std::array<DATA_T, 2>& din, DATA_T& dout, const COEF_T cin[l_COEF]) {
 
             // using 'factor' instead of 'complete' uses BRAM instead of FF
-            #pragma HLS array_reshape variable=sr  complete
             #pragma HLS array_reshape variable=cin complete dim=0
 
-            acc = 0;
-            unsigned short k = 0;
-
-            for (int i=0; i<l_COEF-1; i++) {
-                acc = this->MAC_preadd (sr[k], sr[l_WHOLE-1-k], cin[i], acc);
-                k+=2;  // skipping zero coefficient
-            }
+            firCommon_.acc = { 0 };
+            Mac mac;
+            for (int i=0, k=0; i<l_COEF-1; i++, k+=2)
+                firCommon_.acc = mac(firCommon_.sr[k],
+                                     firCommon_.sr[l_WHOLE-1-k], cin[i], firCommon_.acc);
 
             // center tap
-            acc = this->MAC_preadd (sr[l_HALF], 0, cin[l_COEF-1], acc);
+            firCommon_.acc = mac(firCommon_.sr[l_HALF], cin[l_COEF-1], firCommon_.acc);
 
-            for (int i=l_WHOLE-1; i>1 ; i--)
-                sr[i] = sr[i-2];
+            firCommon_.shift_register({ din[1], din[0] }, firCommon_.sr);
 
-            sr[1] = din0;
-            sr[0] = din1; // most recent sample
-
-            *dout = acc;
+            dout = firCommon_.acc;
 
         }
 
-}; // hb_decim2_class
+}; // FirHbDecim2
 
 #endif
